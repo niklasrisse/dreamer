@@ -1,63 +1,41 @@
-# Dream to Control
+# DREAMER FOR PHYRE
 
-Fast and simple implementation of the Dreamer agent in TensorFlow 2.
+Authors: **Niklas Risse**
 
-<img width="100%" src="https://imgur.com/x4NUHXl.gif">
+Institution: **Bielefeld University**
 
-If you find this code useful, please reference in your paper:
 
-```
-@article{hafner2019dreamer,
-  title={Dream to Control: Learning Behaviors by Latent Imagination},
-  author={Hafner, Danijar and Lillicrap, Timothy and Ba, Jimmy and Norouzi, Mohammad},
-  journal={arXiv preprint arXiv:1912.01603},
-  year={2019}
-}
-```
+## What is in this repository?
++ The code to generate data from the phyre simulator that is usable as training data for dreamer
++ The code to train dreamer with phyre data
++ The code to run dreamer training on the CITEC GPU CLUSTER of Bielefeld University
++ The code to generate images of imagined trajectories for phyre data
 
-## Method
+## How to generate data
+The python script `data-generation/data_generation.py` can generate data for a given task template. Specify the template number via command line argument. The script will generate 5 random solving rollouts and 5 random not solving rollouts for each task in the template. Example code for task template 00023:
 
-![Dreamer](https://imgur.com/JrXC4rh.png)
+`python data_generation.py --template 00023`
 
-Dreamer learns a world model that predicts ahead in a compact feature space.
-From imagined feature sequences, it learns a policy and state-value function.
-The value gradients are backpropagated through the multi-step predictions to
-efficiently learn a long-horizon policy.
+The execution of the script might take a long time (several hours). After the script has terminated, the created episodes can be found in the folder `data-generation/episodes`. To train dreamer with these episodes, copy the folder `data-generation/episodes` to `logdir/dmc_walker_walk/dreamer/1/episodes`. Then create a folder `logdir/dmc_walker_walk/dreamer/1/test_episodes` and move some of the episodes to this folder. These will be the starting points for the imagined trajectories.
 
-- [Project website][website]
-- [Research paper][paper]
-- [Official implementation][code] (TensorFlow 1)
+## How to train dreamer with phyre data
+First you have to generate and move the data as explained above. Then execute the training script with:
 
-[website]: https://danijar.com/dreamer
-[paper]: https://arxiv.org/pdf/1912.01603.pdf
-[code]: https://github.com/google-research/dreamer
+`python phyre_dreamer.py --logdir ./logdir/dmc_walker_walk/dreamer/1 --task dmc_walker_walk --log_images False --log_scalars False`
+ 
+ You might need to delete the file `logdir/dmc_walker_walk/dreamer/1/variables.pkl` after each training run.
 
-## Instructions
+## How to train dreamer with phyre data on the CITEC GPU CLUSTER
+First you have to generate and move the data as explained above. The replace the name `nrisse` in the cluster scripts `cluster-scripts/phyre_dreamer.sbatch` and `cluster-scripts/phyre_dreamer.sh` with your home directory. The you can execute the training with: 
 
-Get dependencies:
+` sbatch cluster-scripts/phyre_dreamer.sbatch` 
 
-```
-pip3 install --user tensorflow-gpu==2.1.0
-pip3 install --user tensorflow_probability
-pip3 install --user git+git://github.com/deepmind/dm_control.git
-pip3 install --user pandas
-pip3 install --user matplotlib
-```
+You might need to delete the file `logdir/dmc_walker_walk/dreamer/1/variables.pkl` after each training run.
 
-Train the agent:
+## How to generate images of imagined trajectories
+Images of imagined trajectories are generated automatically during training, starting from random timesteps of the episodes in the directory `logdir/dmc_walker_walk/dreamer/1/test_episodes`. They will be saved in the directory `img`, which will be also created during training.
 
-```
-python3 dreamer.py --logdir ./logdir/dmc_walker_walk/dreamer/1 --task dmc_walker_walk
-```
+## Installation
 
-Generate plots:
-
-```
-python3 plotting.py --indir ./logdir --outdir ./plots --xaxis step --yaxis test/return --bins 3e4
-```
-
-Graphs and GIFs:
-
-```
-tensorboard --logdir ./logdir
-```
+## Contact
+If you have a problem or question regarding the code, please contact [Niklas Risse](https://github.com/niklasrisse).

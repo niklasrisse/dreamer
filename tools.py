@@ -97,7 +97,7 @@ def encode_gif(frames, fps):
   return out
 
 
-def simulate(agent, envs, steps=0, episodes=0, state=None):
+def simulate(agent, envs, steps=0, episodes=0, state=None, orig_step=1):
   # Initialize or unpack simulation state.
   if state is None:
     step, episode = 0, 0
@@ -116,7 +116,7 @@ def simulate(agent, envs, steps=0, episodes=0, state=None):
         obs[index] = promise()
     # Step agents.
     obs = {k: np.stack([o[k] for o in obs]) for k in obs[0]}
-    action, agent_state = agent(obs, done, agent_state)
+    action, agent_state = agent(obs, done, agent_state, orig_step=orig_step)
     action = np.array(action)
     assert len(action) == len(envs)
     # Step envs.

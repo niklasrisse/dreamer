@@ -8,17 +8,21 @@ import sys
 import time
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['MUJOCO_GL'] = 'egl'
+os.environ['MUJOCO_GL'] = 'osmesa'
 
 import numpy as np
+import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.mixed_precision import experimental as prec
 
-tf.get_logger().setLevel('ERROR')
-
 from tensorflow_probability import distributions as tfd
 
+tf.get_logger().setLevel('INFO')
+
 sys.path.append(str(pathlib.Path(__file__).parent))
+
+from pathlib import Path
+import os.path
 
 import models
 import tools
@@ -33,8 +37,8 @@ def define_config():
   config.steps = 5e6
   config.eval_every = 1e4
   config.log_every = 1e3
-  config.log_scalars = True
-  config.log_images = True
+  config.log_scalars = False
+  config.log_images = False
   config.gpu_growth = True
   config.precision = 16
   # Environment.
@@ -60,9 +64,9 @@ def define_config():
   config.weight_decay = 0.0
   config.weight_decay_pattern = r'.*'
   # Training.
-  config.batch_size = 50
-  config.batch_length = 50
-  config.train_every = 1000
+  config.batch_size = 10
+  config.batch_length = 10
+  config.train_every = 100
   config.train_steps = 100
   config.pretrain = 100
   config.model_lr = 6e-4
@@ -73,7 +77,7 @@ def define_config():
   # Behavior.
   config.discount = 0.99
   config.disclam = 0.95
-  config.horizon = 15
+  config.horizon = 100
   config.action_dist = 'tanh_normal'
   config.action_init_std = 5.0
   config.expl = 'additive_gaussian'
@@ -85,7 +89,7 @@ def define_config():
 
 class Dreamer(tools.Module):
 
-  def __init__(self, config, datadir, actspace, writer):
+  def __init__(self, config, datadir, test_datadir, actspace, writer):
     self._c = config
     self._actspace = actspace
     self._actdim = actspace.n if hasattr(actspace, 'n') else actspace.shape[0]
@@ -101,13 +105,18 @@ class Dreamer(tools.Module):
     self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    self._strategy = tf.distribute.MirroredStrategy()
+    self.already_printed_dict = dict()
+
+    print(tf.config.list_physical_devices())
+    self._strategy = tf.distribute.MirroredStrategy(devices=["device:GPU:0"])
     with self._strategy.scope():
       self._dataset = iter(self._strategy.experimental_distribute_dataset(
           load_dataset(datadir, self._c)))
+      self._test_dataset = iter(self._strategy.experimental_distribute_dataset(
+        load_test_dataset(test_datadir, self._c)))
       self._build_model()
 
-  def __call__(self, obs, reset, state=None, training=True):
+  def __call__(self, obs, reset, state=None, training=True, orig_step=1):
     step = self._step.numpy().item()
     tf.summary.experimental.set_step(step)
     if state is not None and reset.any():
@@ -120,7 +129,7 @@ class Dreamer(tools.Module):
       with self._strategy.scope():
         for train_step in range(n):
           log_images = self._c.log_images and log and train_step == 0
-          self.train(next(self._dataset), log_images)
+          self.train(next(self._dataset), next(self._test_dataset), log_images, orig_step, train_step==0)
       if log:
         self._write_summaries()
     action, state = self.policy(obs, state, training)
@@ -151,13 +160,14 @@ class Dreamer(tools.Module):
     self._should_pretrain()
 
   @tf.function()
-  def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+  def train(self, data, test_data, log_images=False, step=1, should_print=False):
+    self._strategy.experimental_run_v2(self._train, args=(data, test_data, log_images, step, should_print))
 
-  def _train(self, data, log_images):
+  def _train(self, data, test_data, log_images, step=1, should_print=False):
     with tf.GradientTape() as model_tape:
       embed = self._encode(data)
       post, prior = self._dynamics.observe(embed, data['action'])
+
       feat = self._dynamics.get_feat(post)
       image_pred = self._decode(feat)
       reward_pred = self._reward(feat)
@@ -176,40 +186,49 @@ class Dreamer(tools.Module):
       model_loss = self._c.kl_scale * div - sum(likes.values())
       model_loss /= float(self._strategy.num_replicas_in_sync)
 
-    with tf.GradientTape() as actor_tape:
-      imag_feat = self._imagine_ahead(post)
-      reward = self._reward(imag_feat).mode()
-      if self._c.pcont:
-        pcont = self._pcont(imag_feat).mean()
-      else:
-        pcont = self._c.discount * tf.ones_like(reward)
-      value = self._value(imag_feat).mode()
-      returns = tools.lambda_return(
-          reward[:-1], value[:-1], pcont[:-1],
-          bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
-      discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
-          [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
-      actor_loss = -tf.reduce_mean(discount * returns)
-      actor_loss /= float(self._strategy.num_replicas_in_sync)
-
-    with tf.GradientTape() as value_tape:
-      value_pred = self._value(imag_feat)[:-1]
-      target = tf.stop_gradient(returns)
-      value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync)
-
     model_norm = self._model_opt(model_tape, model_loss)
-    actor_norm = self._actor_opt(actor_tape, actor_loss)
-    value_norm = self._value_opt(value_tape, value_loss)
 
-    if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
-      if self._c.log_scalars:
-        self._scalar_summaries(
-            data, feat, prior_dist, post_dist, likes, div,
-            model_loss, value_loss, actor_loss, model_norm, value_norm,
-            actor_norm)
-      if tf.equal(log_images, True):
-        self._image_summaries(data, embed, image_pred)
+    with tf.GradientTape() as actor_tape:
+
+      if step%100000 == 0 and step>0:
+
+        if should_print:
+
+          self.already_printed_dict[step] = True
+
+          test_embed = self._encode(test_data)
+          test_post, test_prior = self._dynamics.observe(test_embed, test_data['action'])
+          imag_feat = self._imagine_ahead(test_post)
+
+          imag_feat_sliced = imag_feat[:]
+          decoded_images = self._decode(imag_feat_sliced)
+
+          for j in range(100):
+            for i in [5]:
+              current_normal = decoded_images[j][i].distribution
+              mean = current_normal.loc
+
+              normalized_mean = tf.math.divide(
+                tf.math.subtract(
+                  mean,
+                  tf.reduce_min(mean)
+                ),
+                tf.math.subtract(
+                  tf.reduce_max(mean),
+                  tf.reduce_min(mean)
+                )
+              )
+
+              normalized_mean_int = tf.image.convert_image_dtype(normalized_mean, tf.uint8)
+              image_file = tf.io.encode_jpeg(
+                normalized_mean_int
+              )
+              file_name = "./img/steps{}traj{}img{}.jpg".format(step,i, j)
+              tf.io.write_file(tf.constant(file_name), image_file)
+
+
+
+
 
   def _build_model(self):
     acts = dict(
@@ -236,12 +255,10 @@ class Dreamer(tools.Module):
         tools.Adam, wd=self._c.weight_decay, clip=self._c.grad_clip,
         wdpattern=self._c.weight_decay_pattern)
     self._model_opt = Optimizer('model', model_modules, self._c.model_lr)
-    self._value_opt = Optimizer('value', [self._value], self._c.value_lr)
-    self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
     # Do a train step to initialize all variables, including optimizer
     # statistics. Ideally, we would use batch size zero, but that doesn't work
     # in multi-GPU mode.
-    self.train(next(self._dataset))
+    self.train(next(self._dataset), next(self._test_dataset))
 
   def _exploration(self, action, training):
     if training:
@@ -272,8 +289,7 @@ class Dreamer(tools.Module):
       post = {k: v[:, :-1] for k, v in post.items()}
     flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
     start = {k: flatten(v) for k, v in post.items()}
-    policy = lambda state: self._actor(
-        tf.stop_gradient(self._dynamics.get_feat(state))).sample()
+    policy = lambda state: np.ones((100, 6), dtype=np.float16)
     states = tools.static_scan(
         lambda prev, _: self._dynamics.img_step(prev, policy(prev)),
         tf.range(self._c.horizon), start)
@@ -353,6 +369,19 @@ def load_dataset(directory, config):
   dataset = dataset.prefetch(10)
   return dataset
 
+def load_test_dataset(directory, config):
+  episode = next(tools.load_episodes(directory, 1))
+  types = {k: v.dtype for k, v in episode.items()}
+  shapes = {k: (None,) + v.shape[1:] for k, v in episode.items()}
+  generator = lambda: tools.load_episodes(
+      directory, config.train_steps, config.batch_length,
+      config.dataset_balance)
+  dataset = tf.data.Dataset.from_generator(generator, types, shapes)
+  dataset = dataset.batch(config.batch_size, drop_remainder=True)
+  dataset = dataset.map(functools.partial(preprocess, config=config))
+  dataset = dataset.prefetch(10)
+  return dataset
+
 
 def summarize_episode(episode, config, datadir, writer, prefix):
   episodes, steps = tools.count_episodes(datadir)
@@ -410,11 +439,12 @@ def main(config):
 
   # Create environments.
   datadir = config.logdir / 'episodes'
+  test_datadir = config.logdir / 'test_episodes'
   writer = tf.summary.create_file_writer(
       str(config.logdir), max_queue=1000, flush_millis=20000)
   writer.set_as_default()
   train_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'train', datadir, store=True), config.parallel)
+      config, writer, 'train', datadir, store=False), config.parallel)
       for _ in range(config.envs)]
   test_envs = [wrappers.Async(lambda: make_env(
       config, writer, 'test', datadir, store=False), config.parallel)
@@ -430,9 +460,9 @@ def main(config):
   writer.flush()
 
   # Train and regularly evaluate the agent.
-  step = count_steps(datadir, config)
+  step = 0
   print(f'Simulating agent for {config.steps-step} steps.')
-  agent = Dreamer(config, datadir, actspace, writer)
+  agent = Dreamer(config, datadir, test_datadir, actspace, writer)
   if (config.logdir / 'variables.pkl').exists():
     print('Load checkpoint.')
     agent.load(config.logdir / 'variables.pkl')
@@ -444,8 +474,8 @@ def main(config):
     writer.flush()
     print('Start collection.')
     steps = config.eval_every // config.action_repeat
-    state = tools.simulate(agent, train_envs, steps, state=state)
-    step = count_steps(datadir, config)
+    state = tools.simulate(agent, train_envs, steps, state=state, orig_step=step)
+    step += 10000
     agent.save(config.logdir / 'variables.pkl')
   for env in train_envs + test_envs:
     env.close()
@@ -457,6 +487,12 @@ if __name__ == '__main__':
     colored_traceback.add_hook()
   except ImportError:
     pass
+
+  try:
+    os.mkdir('img')
+  except:
+    pass
+
   parser = argparse.ArgumentParser()
   for key, value in define_config().items():
     parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
